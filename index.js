@@ -1,26 +1,22 @@
 const express = require("express");
 const crypto = require("crypto");
-const mysql = require("mysql2");
+const mysql = require("mysql2/promise");
 const cors = require("cors");
 
 const app = express();
-const port = 3000;
+const PORT = 3000;
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static("public")); // Ini folder untuk file HTML nanti
+app.use(express.static("public"));
 
 // --- KONEKSI DATABASE ---
-// Settingan sesuai punya kamu
 const dbPool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "ookwlan24", 
   database: "api_key",   
-  port: 3307,            
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
+  port: 3307
 });
 
 (async () => {
@@ -32,120 +28,135 @@ const dbPool = mysql.createPool({
   }
 })();
 
+// =================================================
+// 1. GENERATE API KEY (Logika Sesuai DB Kamu)
+// =================================================
 app.post("/generate-api-key", async (req, res) => {
   try {
     const { firstName, lastName, email } = req.body;
 
     if (!email || !firstName) {
-      return res.status(400).json({ error: "Nama Depan dan Email wajib diisi!" });
+      return res.status(400).json({ error: "Nama dan Email wajib diisi!" });
     }
 
-    // 1. Cek apakah user sudah ada?
-    const [users] = await dbPool.query("SELECT id FROM users WHERE email = ?", [email]);
-    let userId;
-
-    if (users.length > 0) {
-      userId = users[0].id; // User lama
-    } else {
-      // User baru -> Insert
-      const [result] = await dbPool.query(
-        "INSERT INTO users (first_name, last_name, email) VALUES (?, ?, ?)",
-        [firstName, lastName, email]
-      );
-      userId = result.insertId;
-    }
-
-    // 2. Buat Key Random
-    const apiKey = "sk_live_" + crypto.randomBytes(32).toString("hex");
-    
-    // 3. Atur Tanggal (Expired 30 hari)
+    const apiKeyString = "sk_live_" + crypto.randomBytes(32).toString("hex");
     const startDate = new Date();
     const endDate = new Date();
-    endDate.setDate(endDate.getDate() + 30); 
+    endDate.setDate(endDate.getDate() + 30);
 
-    // 4. Simpan Key ke Database
-    await dbPool.query(
-      "INSERT INTO api_keys (user_id, api_key, status, start_date, end_date) VALUES (?, ?, 'active', ?, ?)",
-      [userId, apiKey, startDate, endDate]
+    // Insert API KEY
+    const [result] = await dbPool.query(
+      "INSERT INTO apiKey (api_key, status, start_date, end_date) VALUES (?, 'active', ?, ?)",
+      [apiKeyString, startDate, endDate]
     );
 
-    console.log(`API Key dibuat untuk: ${email}`);
-    res.json({ apiKey: apiKey });
+    const apiKeyId = result.insertId; // <--- PENTING
+
+    // Insert User
+    await dbPool.query(
+      "INSERT INTO users (first_name, last_name, email, id_apikey) VALUES (?, ?, ?, ?)",
+      [firstName, lastName, email, apiKeyId]
+    );
+
+    res.json({ apiKey: apiKeyString });
+
+  } catch (error) {
+    console.error("MYSQL ERROR:", error); // <--- TARO DI SINI
+
+    if (error.code === "ER_DUP_ENTRY") {
+      return res.status(400).json({ error: "Email sudah terdaftar!" });
+    }
+
+    res.status(500).json({ error: "Gagal memproses data." });
+  }
+});
+// =================================================
+// 2. ADMIN: LIST USERS
+// =================================================
+app.get("/admin/list-users", async (req, res) => {
+  try {
+    const [rows] = await dbPool.query("SELECT * FROM users");
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: "Gagal ambil data users" });
+  }
+});
+
+// =================================================
+// 3. ADMIN: LIST APIKEYS
+// =================================================
+app.get("/admin/list-apikeys", async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        apiKey.id,
+        apiKey.api_key,
+        apiKey.status,
+        apiKey.start_date,
+        apiKey.end_date,
+        users.email AS owner_email,
+        users.first_name
+      FROM apiKey
+      LEFT JOIN users ON users.id_apikey = apiKey.id
+    `;
+
+    const [rows] = await dbPool.query(query);
+    res.json(rows);
 
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Gagal membuat key" });
+    res.status(500).json({ error: "Gagal ambil data keys" });
   }
 });
 
-// ----------------------------------------------------
-// ROUTE 2: VALIDASI / CEK KEY
-// ----------------------------------------------------
-app.post("/check", async (req, res) => {
+// =================================================
+// 4. ADMIN REGISTER & LOGIN
+// =================================================
+app.post("/admin/create", async (req, res) => {
   try {
-    const { apikey } = req.body;
-    if (!apikey) return res.status(400).json({ status: "error", message: "API key kosong" });
+    const { email, password } = req.body;
+    await dbPool.query(
+      "INSERT INTO admins (email, password) VALUES (?, ?)",
+      [email, password]
+    );
+    res.json({ message: "Admin berhasil dibuat" });
+  } catch (error) {
+    res.status(500).json({ error: "Gagal membuat admin" });
+  }
+});
 
-    // Join table biar tau siapa pemiliknya
-    const query = `
-      SELECT k.*, u.email, u.first_name 
-      FROM api_keys k 
-      JOIN users u ON k.user_id = u.id 
-      WHERE k.api_key = ?
-    `;
+app.post("/admin/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
 
-    const [rows] = await dbPool.query(query, [apikey]);
+    const [rows] = await dbPool.query(
+      "SELECT * FROM admins WHERE email = ? AND password = ?",
+      [email, password]
+    );
 
     if (rows.length > 0) {
-      const data = rows[0];
-      const now = new Date();
-      const expiredDate = new Date(data.end_date);
-
-      if (data.status !== 'active') return res.status(403).json({ status: "error", message: "Key Tidak Aktif" });
-      if (now > expiredDate) return res.status(403).json({ status: "error", message: "Key Sudah Expired" });
-
-      res.json({
-        status: "sukses",
-        message: "API key valid",
-        owner: `${data.first_name} (${data.email})`,
-        expires_at: data.end_date
-      });
+      res.json({ status: "success", message: "Login berhasil!" });
     } else {
-      res.status(404).json({ status: "error", message: "Key tidak ditemukan" });
+      res.status(401).json({ status: "error", message: "Email/Password salah" });
     }
+
   } catch (error) {
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Error server" });
   }
 });
 
-// ----------------------------------------------------
-// ROUTE 3: ADMIN (Lihat Data & Hapus)
-// ----------------------------------------------------
-app.get("/admin/keys", async (req, res) => {
+// =================================================
+// 5. DELETE API KEY
+// =================================================
+app.delete("/admin/delete-key/:id", async (req, res) => {
   try {
-    const query = `
-      SELECT api_keys.id, users.first_name, users.email, api_keys.api_key, api_keys.status 
-      FROM api_keys 
-      JOIN users ON api_keys.user_id = users.id
-      ORDER BY api_keys.created_at DESC
-    `;
-    const [rows] = await dbPool.query(query);
-    res.json(rows);
+    await dbPool.query("DELETE FROM apiKey WHERE id = ?", [req.params.id]);
+    res.json({ message: "Key berhasil dihapus" });
   } catch (error) {
-    res.status(500).json({ error: "Gagal ambil data" });
+    res.status(500).json({ error: "Gagal hapus key" });
   }
 });
 
-app.delete("/admin/keys/:id", async (req, res) => {
-  try {
-    await dbPool.query("DELETE FROM api_keys WHERE id = ?", [req.params.id]);
-    res.json({ message: "Berhasil dihapus" });
-  } catch (error) {
-    res.status(500).json({ error: "Gagal hapus" });
-  }
-});
-
-// JALANKAN SERVER
-app.listen(port, () => {
-  console.log(`🚀 Server jalan di http://localhost:${port}`);
+app.listen(PORT, () => {
+  console.log(`🚀 Server jalan di http://localhost:${PORT}`);
 });
