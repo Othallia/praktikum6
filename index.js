@@ -22,3 +22,12 @@ const dbPool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0,
 });
+
+(async () => {
+  try {
+    await dbPool.query("SELECT 1");
+    console.log("✅ Berhasil terhubung ke database MySQL (api_key)");
+  } catch (err) {
+    console.error("❌ GAGAL terhubung ke database:", err.message);
+  }
+})();
